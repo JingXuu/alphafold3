@@ -3,7 +3,7 @@
 #      -> 为每个 binder MPNN 序列构造 (A,B,C) 三链 *_data.json，调用 AF3 fold（不跑MSA）
 #
 # 用法：
-#   bash complex/code/run_af3_fold_add_binder.sh \
+#   bash complex/code/run_af3_fold_add_binder_split.sh \
 #       <fold_root_dir> \
 #       <af3_dp_root> \
 #       <af3_model_dir> \
@@ -14,7 +14,14 @@
 #     ./complex/fold_try \
 #     ./data/split_msas/af3_datapipeline_output/af3-dp-20251221-021152-272270354 \
 #     ~/public_databases/models \
-#     ./data/af3_fold_results_try
+#     ./data/af3_fold_results
+#
+# CUDA_VISIBLE_DEVICES=1 nohup bash complex/code/run_af3_fold_add_binder_split.sh \
+#     ./data/test \
+#     ./data/split_msas/af3_datapipeline_output/af3-dp-20251221-021152-272270354 \
+#     ~/public_databases/models \
+#     ./data/test_results \
+#     > ./data/logs/af3_$(date +%Y%m%d-%H%M%S).log 2>&1 &
 #
 # 说明：
 #   - datapipeline 已被拆分为 A-only / C-only：各自有独立 *_data.json（含 MSA + 模板）
@@ -22,8 +29,13 @@
 #   - AF3 用 job 目录作为 input_dir + --norun_data_pipeline 做推理
 #   - 输出目录结构：
 #       OUT_ROOT/PDB_ID/binder_root/job_name/
-#
-#   - OUT_ROOT/folded_jobs.txt 记录已完成的 job_name，便于断点续跑
+#         <pdb_id>_data.json        # 三链数据
+#         job_name/                 # AF3 真正的输出目录
+#           job_name_summary_confidences.json
+#           job_name_model.cif
+#           ...
+#   - OUT_ROOT/metrics.csv 记录每个 job 的 iptm / scRMSD 等指标
+#   - 每次 fold 前，只根据 metrics.csv 中是否已有该 job_name 的记录来决定是否跳过。
 
 set -euo pipefail
 
@@ -47,18 +59,27 @@ OUTPUT_ROOT="$(readlink -f "${OUTPUT_ROOT}")"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 AF3_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-echo "[INFO] FOLD_ROOT   = ${FOLD_ROOT}"
-echo "[INFO] AF3_DP_ROOT = ${AF3_DP_ROOT}"
-echo "[INFO] MODEL_DIR   = ${MODEL_DIR}"
-echo "[INFO] OUTPUT_ROOT = ${OUTPUT_ROOT}"
-echo "[INFO] AF3_ROOT    = ${AF3_ROOT}"
+MERGE_SCRIPT="${SCRIPT_DIR}/merge_ac_add_binder.py"
+METRICS_SCRIPT="${SCRIPT_DIR}/compute_metrics.py"
+
+echo "[INFO] FOLD_ROOT    = ${FOLD_ROOT}"
+echo "[INFO] AF3_DP_ROOT  = ${AF3_DP_ROOT}"
+echo "[INFO] MODEL_DIR    = ${MODEL_DIR}"
+echo "[INFO] OUTPUT_ROOT  = ${OUTPUT_ROOT}"
+echo "[INFO] AF3_ROOT     = ${AF3_ROOT}"
+echo "[INFO] MERGE_SCRIPT   = ${MERGE_SCRIPT}"
+echo "[INFO] METRICS_SCRIPT = ${METRICS_SCRIPT}"
 
 mkdir -p "${OUTPUT_ROOT}"
 
-# 维护一个全局 folded_list.txt，记录已经跑过的 job_name（比如 1NSG_l83_s113551_mpnn5）
-FOLDED_LIST="${OUTPUT_ROOT}/folded_jobs.txt"
-touch "${FOLDED_LIST}"
-echo "[INFO] FOLDED_LIST = ${FOLDED_LIST}"
+# 全局指标文件：首行表头
+METRICS_CSV="${OUTPUT_ROOT}/metrics.csv"
+if [ ! -f "${METRICS_CSV}" ]; then
+  echo "job_name,pdb_id,binder_root,iptm,sc_rmsd,model_rank,pred_path,ref_path" > "${METRICS_CSV}"
+  echo "[INFO] Created metrics CSV: ${METRICS_CSV}"
+else
+  echo "[INFO] Reusing existing metrics CSV: ${METRICS_CSV}"
+fi
 
 # 切换到 AF3 根目录，便于直接调用 run_alphafold.py
 cd "${AF3_ROOT}"
@@ -69,7 +90,7 @@ cd "${AF3_ROOT}"
 find_cached_data_json() {
   # $1: pdb_id_upper (e.g., 1A7X)
   # $2: pdb_id_lower (e.g., 1a7x)
-  # $3: chain_id     (A or C)  -- 注意：我们内部会同时尝试 A/a
+  # $3: chain_id     (A or C)
   local pdbU="$1"
   local pdbL="$2"
   local chain="$3"
@@ -78,24 +99,17 @@ find_cached_data_json() {
   local chainL
   chainL="$(echo "${chain}" | tr '[:upper:]' '[:lower:]')"  # A->a, C->c
 
-  # 你现在的真实输出形如：msa/1a7x_a/1a7x_a_data.json
   local cand=(
-    # 1) 最精确：小写 pdb + 小写链
     "${AF3_DP_ROOT}/msa/${pdbL}_${chainL}/${pdbL}_${chainL}_data.json"
-    # 2) 小写 pdb + 大写链（兼容）
     "${AF3_DP_ROOT}/msa/${pdbL}_${chainU}/${pdbL}_${chainU}_data.json"
-    # 3) 大写 pdb + 小写链（兼容）
     "${AF3_DP_ROOT}/msa/${pdbU}_${chainL}/${pdbU}_${chainL}_data.json"
-    # 4) 大写 pdb + 大写链（兼容）
     "${AF3_DP_ROOT}/msa/${pdbU}_${chainU}/${pdbU}_${chainU}_data.json"
 
-    # 5) 目录存在但文件名不完全一致时的通配兜底
     "${AF3_DP_ROOT}/msa/${pdbL}_${chainL}"/*_data.json
     "${AF3_DP_ROOT}/msa/${pdbL}_${chainU}"/*_data.json
     "${AF3_DP_ROOT}/msa/${pdbU}_${chainL}"/*_data.json
     "${AF3_DP_ROOT}/msa/${pdbU}_${chainU}"/*_data.json
 
-    # 6) 更宽松兜底：目录名包含 <pdb>_<chain> 即可（应对 job_name 不止 4 位）
     "${AF3_DP_ROOT}/msa/"*"${pdbL}_${chainL}"*/*_data.json
     "${AF3_DP_ROOT}/msa/"*"${pdbL}_${chainU}"*/*_data.json
     "${AF3_DP_ROOT}/msa/"*"${pdbU}_${chainL}"*/*_data.json
@@ -116,9 +130,8 @@ find_cached_data_json() {
   return 1
 }
 
-
 ########################################
-# Helper: 由 A_data_json + C_data_json + binder_fasta 合成三链 data json
+# Helper: 调用 Python 合成三链 data json
 ########################################
 merge_ac_add_binder() {
   # $1 A_data_json
@@ -134,78 +147,13 @@ merge_ac_add_binder() {
   local out_json="$5"
   local binder_chain="${6:-B}"
 
-  python - "${a_json}" "${c_json}" "${fasta}" "${job_name}" "${out_json}" "${binder_chain}" <<'PY'
-import json, sys, re
-
-a_json, c_json, fasta, job_name, out_json, binder_chain = sys.argv[1:]
-
-def read_fasta_one(path: str) -> str:
-    seq = []
-    with open(path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith(">"):
-                continue
-            seq.append(line)
-    s = "".join(seq).replace(" ", "").upper()
-    if not s or re.search(r"[^ACDEFGHIKLMNPQRSTVWYBXZJUO]", s):
-        # 这里不做过度严格限制；若包含非常规字符，AF3 可能会报错
-        pass
-    return s
-
-def load_json(path: str):
-    with open(path, "r") as f:
-        return json.load(f)
-
-def get_protein_entry(obj: dict, chain_id: str) -> dict:
-    seqs = obj.get("sequences", [])
-    for s in seqs:
-        prot = s.get("protein")
-        if prot and prot.get("id") == chain_id:
-            return s
-    raise RuntimeError(f"Cannot find protein chain id={chain_id} in {obj.get('name','<no-name>')}")
-
-A = load_json(a_json)
-C = load_json(c_json)
-
-A_entry = get_protein_entry(A, "A")
-C_entry = get_protein_entry(C, "C")
-
-binder_seq = read_fasta_one(fasta)
-
-B_entry = {
-    "protein": {
-        "id": binder_chain,
-        "sequence": binder_seq,
-        # 明确 MSA-free / template-free
-        "unpairedMsa": "",
-        "pairedMsa": "",
-        "templates": []
-    }
-}
-
-# 以 A 的 data.json 为基底，尽量保留 datapipeline 生成的其它顶层字段（如果存在）
-out = dict(A)
-
-# name 改为 job_name（不依赖文件名）
-out["name"] = job_name
-
-# 关键：合并成三链 sequences（顺序 A,B,C）
-out["sequences"] = [A_entry, B_entry, C_entry]
-
-# 如果 C 的 data.json 有一些顶层键 A 没有，但你希望保留，可以按需合并（默认不强行覆盖 A）
-# 这里做一个温和合并：缺失键补上
-for k, v in C.items():
-    if k not in out:
-        out[k] = v
-
-with open(out_json, "w") as f:
-    json.dump(out, f, ensure_ascii=False, indent=2)
-
-print(f"[merge_ac_add_binder] wrote {out_json}")
-PY
+  python "${MERGE_SCRIPT}" \
+    --a_json "${a_json}" \
+    --c_json "${c_json}" \
+    --fasta "${fasta}" \
+    --job_name "${job_name}" \
+    --out_json "${out_json}" \
+    --binder_chain "${binder_chain}"
 }
 
 ########################################
@@ -218,7 +166,6 @@ for target_dir in "${FOLD_ROOT}"/*; do
   [ -d "${target_dir}" ] || continue
 
   target_base="$(basename "${target_dir}")"
-  # 例如 target_base = 1NSG_time_check_af3_1
   pdb_id="${target_base:0:4}"
   pdb_id_upper="$(echo "${pdb_id}" | tr '[:lower:]' '[:upper:]')"  # 1NSG
   pdb_id_lower="$(echo "${pdb_id}" | tr '[:upper:]' '[:lower:]')"  # 1nsg
@@ -229,46 +176,40 @@ for target_dir in "${FOLD_ROOT}"/*; do
   echo "[INFO] PDB_ID     : ${pdb_id_upper}"
   echo "==============================="
 
-  # 定位 A/C 的 cached data json（split 后独立）
   cached_data_json_A="$(find_cached_data_json "${pdb_id_upper}" "${pdb_id_lower}" "A" || true)"
   cached_data_json_C="$(find_cached_data_json "${pdb_id_upper}" "${pdb_id_lower}" "C" || true)"
 
   if [ -z "${cached_data_json_A}" ] || [ ! -f "${cached_data_json_A}" ]; then
     echo "[WARN] Cached A data json not found for ${pdb_id_upper}. Skip this target."
-    echo "[WARN]   Tried under: ${AF3_DP_ROOT}/msa/*${pdb_id_upper}_A*/*_data.json"
     continue
   fi
   if [ -z "${cached_data_json_C}" ] || [ ! -f "${cached_data_json_C}" ]; then
     echo "[WARN] Cached C data json not found for ${pdb_id_upper}. Skip this target."
-    echo "[WARN]   Tried under: ${AF3_DP_ROOT}/msa/*${pdb_id_upper}_C*/*_data.json"
     continue
   fi
 
   echo "[INFO] Cached A data json: ${cached_data_json_A}"
   echo "[INFO] Cached C data json: ${cached_data_json_C}"
 
-  # 该 target 对应的 MPNN 序列目录
   mpnn_seq_dir="${target_dir}/MPNN/Sequences"
   if [ ! -d "${mpnn_seq_dir}" ]; then
     echo "[WARN] No MPNN/Sequences dir under ${target_dir}, skip."
     continue
   fi
 
-  # 为该 target 单独建一个输出子目录
   target_out_root="${OUTPUT_ROOT}/${pdb_id_upper}"
   mkdir -p "${target_out_root}"
 
-  # 遍历所有 binder FASTA
   for fasta in "${mpnn_seq_dir}"/*.fasta; do
     [ -f "${fasta}" ] || continue
 
-    fasta_base="$(basename "${fasta}")"           # 例如 1NSG_l83_s113551_mpnn5.fasta
-    job_name="${fasta_base%.fasta}"              # 1NSG_l83_s113551_mpnn5
-    binder_root="${job_name%_mpnn*}"             # 1NSG_l83_s113551
+    fasta_base="$(basename "${fasta}")"           # 1NSG_l100_s313180_mpnn1.fasta
+    job_name="${fasta_base%.fasta}"              # 1NSG_l100_s313180_mpnn1
+    binder_root="${job_name%_mpnn*}"             # 1NSG_l100_s313180
 
-    # 利用 folded_list.txt 去重
-    if grep -qx "${job_name}" "${FOLDED_LIST}"; then
-      echo "[INFO]   Skip already folded job: ${job_name}"
+    # 只根据 metrics.csv 去重
+    if grep -q "^${job_name}," "${METRICS_CSV}"; then
+      echo "[INFO]   Skip already evaluated job (metrics.csv): ${job_name}"
       continue
     fi
 
@@ -276,15 +217,26 @@ for target_dir in "${FOLD_ROOT}"/*; do
     echo "[INFO]     FASTA       : ${fasta}"
     echo "[INFO]     binder_root : ${binder_root}"
 
-    # 输出目录：OUT_ROOT/1NSG/1NSG_l83_s113551/1NSG_l83_s113551_mpnn5/
+    # Trajectory 下必须有对应的骨架 PDB，否则跳过
+    traj_dir="${target_dir}/Trajectory"
+    if [ ! -d "${traj_dir}" ]; then
+      echo "[WARN]   No Trajectory dir under ${target_dir}, skip job ${job_name}."
+      continue
+    fi
+
+    ref_pdb_for_job=""
+    ref_pdb_for_job=$(find "${traj_dir}" -maxdepth 1 -type f -name "${binder_root}.pdb" | head -n 1 || true)
+
+    if [ -z "${ref_pdb_for_job}" ]; then
+      echo "[WARN]   No reference PDB ${binder_root}.pdb under ${traj_dir}, skip job ${job_name}."
+      continue
+    fi
+    echo "[INFO]     Found reference PDB for this job: ${ref_pdb_for_job}"
+
     binder_out_root="${target_out_root}/${binder_root}"
     job_out_dir="${binder_out_root}/${job_name}"
     mkdir -p "${job_out_dir}"
 
-    ########################################
-    # 1) 为该 job 构造专用的三链 *_data.json
-    #    从 cached A/C data json 拷贝信息 + 插入 B（MSA-free）
-    ########################################
     job_data_json="${job_out_dir}/${pdb_id_lower}_data.json"
 
     merge_ac_add_binder \
@@ -297,9 +249,6 @@ for target_dir in "${FOLD_ROOT}"/*; do
 
     echo "[INFO]     Patched 3-chain data json: ${job_data_json}"
 
-    ########################################
-    # 2) 调用 AF3 ：input_dir 指向 job_out_dir，norun_data_pipeline
-    ########################################
     echo "[INFO]     Calling AF3 fold for ${job_name}"
 
     python run_alphafold.py \
@@ -308,8 +257,18 @@ for target_dir in "${FOLD_ROOT}"/*; do
       --output_dir "${job_out_dir}" \
       --norun_data_pipeline
 
-    # 若 run 成功，则把 job_name 记入 folded_list
-    echo "${job_name}" >> "${FOLDED_LIST}"
+    ########################################
+    # 3) 计算 iptm + scRMSD，一次写入 metrics.csv
+    ########################################
+    python "${METRICS_SCRIPT}" \
+      --job_out_dir "${job_out_dir}" \
+      --job_name "${job_name}" \
+      --pdb_id "${pdb_id_upper}" \
+      --target_dir "${target_dir}" \
+      --metrics_csv "${METRICS_CSV}" \
+      --binder_root "${binder_root}" \
+      --mode all
+
     echo "[INFO]     Finished job: ${job_name}"
   done
 
@@ -317,5 +276,5 @@ done
 
 echo
 echo "[INFO] All done."
-echo "[INFO] Folded jobs are listed in: ${FOLDED_LIST}"
+echo "[INFO] Metrics CSV: ${METRICS_CSV}"
 echo "[INFO] Outputs are under: ${OUTPUT_ROOT}"
